@@ -4,7 +4,9 @@ Raspberry Pi rig that feeds a stack of cards, photographs each one, and
 posts the photos to the TrainerDeck mail-in scanning service. The full
 API contract this rig implements lives in
 [`docs/bulkscan-contract.md`](docs/bulkscan-contract.md) — read that first
-if you're touching `rig/uploader.py`.
+if you're touching `rig/uploader.py`. For the parts list, wiring, and
+what still needs to be physically built, see
+[`docs/hardware-build-guide.md`](docs/hardware-build-guide.md).
 
 ## Status
 
