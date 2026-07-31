@@ -1,0 +1,7 @@
+requests>=2.31
+python-dotenv>=1.0
+gpiozero>=2.0
+
+# picamera2 is NOT installed via pip here — on Raspberry Pi OS it comes
+# from apt (python3-picamera2) along with the libcamera system bindings.
+# See README.md "Raspberry Pi setup".
