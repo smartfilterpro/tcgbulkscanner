@@ -111,7 +111,12 @@ def run(args, cfg):
                 )
 
             if total_captured % cfg.refocus_every_cards == 0:
-                camera.refocus()
+                if not camera.refocus():
+                    logger.warning(
+                        "seq=%s: capturing right after a failed focus lock — "
+                        "check this photo if the upload comes back unreadable",
+                        seq,
+                    )
 
             frame = camera.capture_array()
             frame_gray = vision.to_gray(frame)

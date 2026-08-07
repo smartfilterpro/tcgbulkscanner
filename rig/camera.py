@@ -42,11 +42,19 @@ class Camera:
     def capture_array(self):
         return self._cam.capture_array("main")
 
-    def refocus(self) -> None:
+    def refocus(self) -> bool:
+        """Runs a blocking autofocus cycle. Returns whether it actually
+        locked — callers should keep going either way (the alternative is
+        no photo at all), but should surface a failed lock to the
+        operator rather than silently capturing at a stale focus."""
         try:
-            self._cam.autofocus_cycle()
+            locked = self._cam.autofocus_cycle()
         except Exception:
-            logger.warning("autofocus cycle failed or unsupported — keeping current focus")
+            logger.warning("autofocus cycle raised — keeping current focus")
+            return False
+        if not locked:
+            logger.warning("autofocus cycle did not lock — capturing at current focus anyway")
+        return bool(locked)
 
     def close(self):
         self._cam.close()
