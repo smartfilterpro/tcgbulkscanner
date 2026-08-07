@@ -4,22 +4,30 @@ Raspberry Pi rig that feeds a stack of cards, photographs each one, and
 posts the photos to the TrainerDeck mail-in scanning service. The full
 API contract this rig implements lives in
 [`docs/bulkscan-contract.md`](docs/bulkscan-contract.md) — read that first
-if you're touching `rig/uploader.py`. For the parts list, wiring, and
-what still needs to be physically built, see
-[`docs/hardware-build-guide.md`](docs/hardware-build-guide.md).
+if you're touching `rig/uploader.py`. The physical machine — a
+bottom-feed magazine that drops cards into a bucket a fixed camera looks
+down into — is described in
+[`docs/hardware-build-guide.md`](docs/hardware-build-guide.md); read that
+first if you're touching `rig/feeder.py` or `rig/vision.py`.
 
 ## Status
 
 - `rig/uploader.py` — implements the contract's retry/halt table exactly
   (401/403/409 halt immediately; 400/5xx/network retry the same seq with
   backoff then halt; a mismatched echoed `seq` halts). Unit-tested.
-- `rig/camera.py` — thin `picamera2` wrapper (Pi-only import, deferred so
-  the rest of the package can be tested off-Pi).
-- `rig/feeder.py` — GPIO control for a single-motor, two-sensor feeder.
-  **This is a starting point, not a finished design** — the physical
-  feeder doesn't exist yet. Expect to adjust pin assumptions, sensor
-  polarity, and timing once it's built (see "Building the feeder" below).
-- `rig/cli.py` — runs one pass of one job end to end.
+- `rig/feeder.py` — GPIO control for the built machine: one motor pulse
+  per card, an edge-pair wait on the exit-arch sensor (transit, not
+  arrival), a hopper sensor for magazine-empty. Distinguishes a misfeed
+  (nothing reached the arch) from a hard jam (something's stuck under
+  it). Unit-tested against a mocked GPIO backend.
+- `rig/camera.py` — `picamera2` wrapper with per-shot autofocus, since
+  the pile-to-lens distance shrinks as the bucket fills.
+- `rig/vision.py` — isolates the newest card from a full-bucket photo by
+  diffing against the previous frame, then crops and deskews it to the
+  image that actually gets uploaded. Unit-tested with synthetic frames.
+- `rig/cli.py` — runs one pass of one job end to end, pausing (not
+  ending the pass) when a magazine runs dry, and pausing again when the
+  bucket needs emptying.
 
 ## Raspberry Pi setup
 
@@ -27,7 +35,8 @@ what still needs to be physically built, see
    `raspi-config` if needed, reboot.
 2. Install the camera stack and GPIO libs from apt (picamera2 is not
    pip-installable in any reliable way on Pi OS — it depends on
-   `libcamera` system bindings):
+   `libcamera` system bindings, including the Python `controls` module
+   used for autofocus):
    ```bash
    sudo apt update
    sudo apt install -y python3-picamera2 python3-libcamera python3-venv
@@ -40,11 +49,27 @@ what still needs to be physically built, see
    source venv/bin/activate
    pip install -r requirements.txt
    ```
-4. Copy the env file and fill in your job's credentials:
+4. Copy the env file and fill in your job's credentials **and the
+   measured values** — see below:
    ```bash
    cp .env.example .env
-   $EDITOR .env   # set BASE_URL and DEVICE_KEY from the admin page
+   $EDITOR .env
    ```
+
+## Two values you must measure before running a real job
+
+`rig.cli` refuses to start (before touching any GPIO pin) unless both
+are set in `.env`:
+
+- **`SETTLE_SECONDS`** — how long a card needs to free-fall off the deck
+  and stop tumbling in the bucket before the shutter fires. Not a fixed
+  hardware constant; measure it on your build.
+- **`BUCKET_CAPACITY_CARDS`** — how many cards can pile up before the
+  stack risks the camera's 100mm minimum focus distance.
+
+See [`docs/hardware-build-guide.md`](docs/hardware-build-guide.md) for
+how to measure both. `scripts/feeder_calibrate.py` does **not** require
+either — it only exercises the feeder, not the camera.
 
 ## Running a job
 
@@ -54,17 +79,24 @@ Pass 1, feed order:
 python -m rig.cli --job <JOB_UUID> --pass 1
 ```
 
-Flip the output pile once (see the contract — do not shuffle or
-re-square), then pass 2:
+The magazine holds ~150 cards; on a bigger job the rig will pause and
+prompt you to load the next magazine rather than ending the pass — keep
+answering the prompt (or type `done` when the pass is actually finished)
+until the whole stack has gone through. It'll similarly pause and prompt
+you to empty the bucket once `BUCKET_CAPACITY_CARDS` is reached.
+
+Flip the **bucket pile** (not a magazine) as one block once the pass is
+done — see the contract — then pass 2:
 
 ```bash
 python -m rig.cli --job <JOB_UUID> --pass 2
 ```
 
 The rig halts (non-zero exit, message on stderr) on anything that means
-"stop and fix something": bad key, wrong/closed job, a feeder jam, or an
-upload that won't succeed after 5 retries. It logs progress per card but
-never logs the device key.
+"stop and fix something": bad key, wrong/closed job, a misfeed, a hard
+jam, an upload that won't succeed after 5 retries, or a SIGTERM/SIGINT —
+in every case the motor is left off before the process exits. It logs
+progress per card but never logs the device key.
 
 If a pass gets interrupted partway through, you can resume the seq
 counter instead of redoing the whole pass:
@@ -74,48 +106,24 @@ python -m rig.cli --job <JOB_UUID> --pass 1 --start-seq 42
 ```
 
 `--max-cards N` caps how many cards a run will process — useful for a
-quick smoke test with a handful of cards before committing to a full box.
+quick smoke test before committing to a full magazine.
 
-## Building the feeder
+## Photo pipeline
 
-`rig/feeder.py` assumes:
-
-- A feed motor driven by a relay/MOSFET on `FEEDER_MOTOR_PIN` — pulsed
-  high for `FEED_PULSE_SECONDS` per card (open-loop, not closed-loop
-  position control).
-- Two IR break-beam/obstacle sensors, wired active-low (pin reads LOW
-  when a card is present): one across the input hopper
-  (`HOPPER_SENSOR_PIN`, used for "are we out of cards"), one at the
-  camera lane (`FEEDER_SENSOR_PIN`, used to confirm a card actually
-  arrived after a feed pulse).
-
-None of that is load-bearing — it's sized for the simplest mechanism
-that could work. Once you've settled on motor/sensor hardware:
-
-```bash
-python scripts/feeder_calibrate.py            # live sensor monitor —
-                                               # confirm polarity by hand
-python scripts/feeder_calibrate.py --pulse    # fire one feed pulse per
-                                               # Enter keypress, tune
-                                               # FEED_PULSE_SECONDS
-```
-
-If the real mechanism ends up materially different (a stepper instead of
-a DC motor, a single sensor instead of two, a solenoid pusher), `rig/feeder.py`
-is the only file that needs to change — `rig/cli.py` only calls
-`has_cards()` and `advance_one_card()`.
-
-## Photo settings
-
-`rig/camera.py` captures at 1600×1200, matching the contract's
-recommended 1200–1600px long side. Lighting and camera positioning are a
-physical rig concern (see the contract's "Photo requirements") — no
-amount of software fixes glare from an overhead point light.
+The camera looks straight down into the bucket, not at one card in a
+fixed frame — see `docs/hardware-build-guide.md` for why that ruled out
+a fixed crop/focus and what `rig/vision.py` does about it (diff against
+the previous frame to isolate the newest card, then crop and deskew).
+Raw, undeskewed frames are also kept under `CAPTURE_DIR/raw/` for
+debugging the crop pipeline. Lighting and camera geometry are a physical
+rig concern (see the contract's "Photo requirements") — no amount of
+software fixes glare from a mis-mounted LED bar.
 
 ## Running the tests
 
 No Pi or hardware required — `gpiozero`'s mock pin factory stands in for
-GPIO, and `responses` mocks the HTTP calls:
+GPIO, `responses` mocks the HTTP calls, and `rig/vision.py` is tested
+against synthetic numpy frames instead of real photos:
 
 ```bash
 pip install -r requirements-dev.txt

@@ -1,9 +1,15 @@
 """Camera wrapper.
 
-picamera2 only installs/works on a Raspberry Pi with libcamera, so the
-import is deferred into __init__ — this lets the rest of the rig (feeder,
-uploader, cli argument parsing) be imported and unit-tested on a regular
-machine without picamera2 present.
+picamera2/libcamera only install on a Raspberry Pi, so the import is
+deferred into __init__ — this lets the rest of the rig (feeder,
+uploader, vision, cli argument parsing) be imported and unit-tested on a
+regular machine without them present.
+
+The rig looks straight down into a bucket whose pile-to-lens distance
+shrinks from ~160mm (empty) to ~113.5mm (full) over a run — both past
+the Camera Module 3's 100mm minimum focus, but a fixed focus locked on
+an empty bucket will be soft by the time it's full. refocus() runs an
+autofocus cycle; cli.py calls it every REFOCUS_EVERY_CARDS cards.
 """
 
 import logging
@@ -16,17 +22,31 @@ DEFAULT_SIZE = (1600, 1200)
 
 class Camera:
     def __init__(self, size=DEFAULT_SIZE, warmup_seconds=1.0):
+        from libcamera import controls
         from picamera2 import Picamera2
 
+        self._controls = controls
         self._cam = Picamera2()
-        still_config = self._cam.create_still_configuration(main={"size": size})
+        # NOTE: RGB888 request - verify on real hardware that channel
+        # order comes back as RGB and not BGR (a known picamera2/libcamera
+        # quirk on some versions); swap in vision.save_jpeg if colors
+        # look wrong in captured JPEGs.
+        still_config = self._cam.create_still_configuration(
+            main={"size": size, "format": "RGB888"}
+        )
         self._cam.configure(still_config)
+        self._cam.set_controls({"AfMode": controls.AfModeEnum.Auto})
         self._cam.start()
-        time.sleep(warmup_seconds)  # let auto-exposure/white-balance settle once
+        time.sleep(warmup_seconds)  # let AE/AWB settle once at startup
 
-    def capture(self, path: str) -> str:
-        self._cam.capture_file(path)
-        return path
+    def capture_array(self):
+        return self._cam.capture_array("main")
+
+    def refocus(self) -> None:
+        try:
+            self._cam.autofocus_cycle()
+        except Exception:
+            logger.warning("autofocus cycle failed or unsupported — keeping current focus")
 
     def close(self):
         self._cam.close()

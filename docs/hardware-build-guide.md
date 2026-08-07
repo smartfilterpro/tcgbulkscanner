@@ -1,135 +1,142 @@
 # Hardware build guide — bulk-scan rig
 
-This is the brief for building the physical rig that `rig/` (the Python
-software in this repo) drives. Hand it to whoever is sourcing parts and
-building the feeder — human or AI — alongside
-[`bulkscan-contract.md`](bulkscan-contract.md) (the API contract) if they
-also need to touch the software.
+> **Supersedes the original version of this document.** The first draft
+> proposed a lane-and-output-tray design: advance a card into a fixed
+> camera framing position, photograph it there, push it to a tray. That
+> was never built. What exists is a **bucket rig** — described below —
+> and `rig/` has been rewritten to match it. If you're looking at old
+> notes, PRs, or a stale checkout that still talks about a "lane sensor"
+> or an output tray, they're describing the abandoned design.
 
 ## What the program does
 
-The software (already built, in `rig/`) runs one **pass** of one **job**
-at a time from the command line:
+Unchanged at the top level: `python -m rig.cli --job <uuid> --pass 1`
+runs one pass of one job — feed a card, photograph it, upload it,
+repeat — twice per job (flip the pile as a block between passes; see
+`bulkscan-contract.md`). What changed is everything about how "feed"
+and "photograph" work mechanically, covered below.
 
-```bash
-python -m rig.cli --job <JOB_UUID> --pass 1
-```
+## The machine as built (ground truth)
 
-Its loop, once started, is entirely mechanical:
+**Actuation.** One 12V gearmotor, switched by an IRLZ44N low-side MOSFET
+on BCM 17. On/off only — no PWM, no speed control, no direction control
+(set by lead polarity), no encoder. One GPIO write is the entire control
+surface. A single pulse must carry one card from the retard gate, across
+the deck, and over the edge into the bucket.
 
-1. Ask the feeder "any cards left?" (`has_cards()`).
-2. If yes, tell the feeder to push one card into camera position
-   (`advance_one_card()`) and wait for it to arrive.
-3. Pause briefly for the card to stop moving (motion blur kills
-   readability).
-4. Take one photo.
-5. POST that photo to the TrainerDeck server with the job ID, pass
-   number, and a sequence number, retrying on transient failures.
-6. Repeat until the hopper is empty.
+**Hopper sensor — BCM 22.** Reflective IR module under the deck, looking
+up through a 3mm sight hole at the underside of the bottom card in the
+magazine. Reads card-present until the last card is pulled. Active-low.
 
-The operator runs this twice per job: once feeding the stack normally
-(pass 1), then flips the output pile as a whole and runs it again
-(pass 2, so cards arrive in reverse order). The server cross-checks the
-two passes to auto-verify each card. None of that pairing/verification
-logic is the rig's concern — the rig's only job is to keep cards moving
-one at a time, keep photos sharp, and never lose track of which physical
-card is which sequence number.
+**Exit sensor — BCM 27.** Reflective IR module on an arch above the
+deck at lane 36, looking down with 12mm clearance; the deck ends at lane
+40. Active-low. **This is a transit detector, 4mm upstream of the deck
+edge — not an arrival detector.** A card trips it on the way past and is
+already falling before it clears. It is never LOW while the card is in
+the camera's view. `rig/feeder.py`'s `advance_one_card()` waits for the
+LOW→HIGH edge (card cleared the arch), not for a level — get this wrong
+and you photograph an empty bucket mid-fall.
 
-**What still needs to be built is everything physical**: a hopper that
-holds a stack of cards, a mechanism that singulates and advances exactly
-one card per pulse, two sensors the software reads to know the hopper
-state and confirm a card arrived, a fixed camera mount, and consistent
-lighting. The software already assumes a specific shape for that
-hardware (see below) — treat that as a proposed design, not a
-requirement, if a different mechanism makes more sense once you're
-sourcing parts.
+**Camera.** Raspberry Pi Camera Module 3, standard lens, on CSI, fixed
+gantry looking straight down into the bucket, rotated 90° so the card's
+long axis lies along the sensor's long axis. Minimum focus 100mm.
 
-## Bill of materials
-
-| Part | Role | Notes |
+| | Empty bucket | Full bucket |
 |---|---|---|
-| Raspberry Pi 4B or 5 (4GB+) | Runs `rig/`, GPIO control | 5 is faster for capture-to-disk; 4B is fine |
-| Raspberry Pi Camera Module 3 (or HQ Camera) | Photographs each card | CSI ribbon, official Pi camera — this is what `picamera2` in `rig/camera.py` talks to |
-| MicroSD card (16GB+) + Pi power supply (official 5V/3A) | Boot media, power | Don't run the feed motor off the Pi's 5V rail — see below |
-| DC gear motor, low RPM (e.g. 6V or 12V, geared down) | Turns a friction roller/belt to advance cards | Pick by whatever roller/belt mechanism you land on; low RPM + high torque beats a fast motor here |
-| Relay module or logic-level MOSFET (e.g. IRLZ44N breakout) | Lets a 3.3V GPIO pin switch motor power on/off | This is `FEEDER_MOTOR_PIN` in the code — an on/off pulse, not variable speed |
-| 2× IR break-beam or IR-obstacle sensor module (active-low output) | Card presence detection | One across the hopper, one at the camera lane — see "Sensor placement" |
-| Separate motor power supply (e.g. 12V wall adapter, sized to the motor + roller load) | Powers the motor independent of the Pi | Share ground with the Pi, not the 5V rail — a stalled motor can brown out the Pi otherwise |
-| 2× diffuse LED strips (~45° mounting angle) | Even lighting, kills holofoil glare | See "Photo requirements" in `bulkscan-contract.md` — this is the single biggest lever on read accuracy |
-| Hopper, roller/belt mechanism, camera arm, output tray | The mechanical structure | 3D-printed or laser-cut; this repo has the `cadquery-part` skill available if you want to model these parametrically |
-| Jumper wires, perfboard or small breadboard, mounting hardware | Wiring | — |
+| Lens to top card | 160mm | 113.5mm |
+| Card width in frame | 1365px | 1924px |
 
-## How the parts map to the code
+Both distances clear the 100mm minimum, but a fixed focus locked on an
+empty bucket will be soft by the time it's full — `rig/camera.py` runs
+an autofocus cycle before capture (every `REFOCUS_EVERY_CARDS` cards).
 
-`rig/config.py` reads pin numbers and timings from `.env` (see
-`.env.example`). Wiring should match these, or you edit `.env` to match
-your wiring — either direction works, nothing is hardcoded elsewhere.
+**Lighting.** Two cross-polarized LED bars at 45°, own 12V supply, not
+controlled from the Pi. **Never PWM-dim these** — against a rolling
+shutter, PWM bands every frame differently.
 
-| `.env` variable | Default (BCM pin) | Wired to |
+**Magazine capacity** is roughly 150 cards. A 1000-card job needs
+several magazine swaps within a single pass.
+
+## Pin and config mapping
+
+Pin assignments are unchanged from the original wiring and don't need
+to move — only the exit sensor's variable name changed, to stop the
+software implying it's a fixed-position "lane" sensor.
+
+| `.env` variable | BCM pin | Wired to |
 |---|---|---|
-| `FEEDER_MOTOR_PIN` | 17 | Relay/MOSFET gate driving the feed motor |
-| `FEEDER_SENSOR_PIN` | 27 | Break-beam sensor at the camera lane |
-| `HOPPER_SENSOR_PIN` | 22 | Break-beam sensor across the input hopper |
-| `FEED_PULSE_SECONDS` | 0.35 | How long the motor runs per card (tune by hand) |
-| `FEED_TIMEOUT_SECONDS` | 2.0 | How long to wait for a card to reach the lane sensor before declaring a jam |
-| `SETTLE_SECONDS` | 0.25 | Pause after the card arrives, before the shutter fires |
-| — | CSI port | Camera Module, read by `rig/camera.py` via `picamera2` |
+| `FEEDER_MOTOR_PIN` | 17 | MOSFET gate driving the feed motor |
+| `FEEDER_EXIT_SENSOR_PIN` | 27 | Reflective IR sensor on the exit arch |
+| `HOPPER_SENSOR_PIN` | 22 | Reflective IR sensor under the magazine |
 
-`rig/feeder.py` currently assumes both sensors are **active-low**
-(reading LOW when a card is blocking the beam) — that's true of most
-cheap IR-obstacle modules but not guaranteed for a true through-beam
-pair. Verify polarity with `scripts/feeder_calibrate.py` before wiring
-assumptions become a debugging session.
+Both sensors are active-low: card present = LOW. That part of the
+original wiring assumption held and didn't need to change.
 
-## Sensor placement
+Timing variables — see `.env.example` for the full commentary, this is
+the summary:
 
-- **Hopper sensor** (`HOPPER_SENSOR_PIN`): positioned so the beam is
-  broken as long as at least one card remains in the input stack, and
-  clears the instant the last card is pulled. This is what
-  `has_cards()` checks — get this wrong and the rig either stops one
-  card early or runs the motor against an empty hopper.
-- **Lane sensor** (`FEEDER_SENSOR_PIN`): positioned right at the camera
-  framing position, so it trips only once a card is fully in place and
-  ready to shoot. `advance_one_card()` blocks until this trips (or times
-  out into a jam) — this is the interlock that keeps the photo from
-  firing on an empty or half-arrived frame.
+| Variable | Status |
+|---|---|
+| `FEED_PULSE_SECONDS` | Starting point 0.55–0.75s, given — tune with `scripts/feeder_calibrate.py` |
+| `FEED_TIMEOUT_SECONDS` | 2.0s default carries margin at the top of that pulse range |
+| `SETTLE_SECONDS` | **Not measured.** No safe default shipped; the rig refuses to start without it set. Free-fall + tumble time, expected to be materially longer than a mechanical-push settle. |
+| `BUCKET_CAPACITY_CARDS` | **Not verified.** No safe default shipped; the rig refuses to start without it set. Do not derive this from card thickness — measure it, or get a verified count, and tell the rig what it is. |
 
-## What needs to be designed and built
+## Why the camera pipeline changed
 
-1. **Hopper** — holds the stack, feeds from the top or bottom (bottom-feed
-   with a friction pad is the usual choice for single-card singulation;
-   top-feed with a kicker also works). Needs to hold enough cards for a
-   sensible batch size without needing a refill mid-pass.
-2. **Singulation + advance mechanism** — a motor-driven roller or belt
-   that reliably pulls exactly one card per pulse. This is the hardest
-   mechanical problem in the whole rig; double-feeds are exactly what
-   the two-pass verification is designed to catch, but fewer of them
-   means fewer cards falling to manual review.
-3. **Camera mount** — fixed distance and angle above the lane, framing
-   one card filling most of the shot per `bulkscan-contract.md`'s photo
-   requirements. Rigid enough that it doesn't drift between cards or
-   between passes.
-4. **Lighting rig** — two diffuse LED strips at roughly 45°, no point
-   sources, no flash. Glare over a holofoil card's name/number is called
-   out in the contract as the top cause of failed reads.
-5. **Output tray** — catches the pile as it's fed, in order, so the
-   operator can flip it as one block between pass 1 and pass 2 without
-   reshuffling.
+The original photo requirements (one card per frame, fixed distance,
+fixed crop) assumed a card presented in a constant position. The bucket
+rig can't give the camera that: every frame is a photo of the whole
+pile, the newest card is just whatever's on top, and the pile grows
+~40% in frame width over a run. `rig/vision.py` compensates in software:
 
-## Suggested build order
+1. Diff the current frame against the photo taken before this card
+   landed. The region that changed is the new card — this also proves,
+   independent of the exit sensor, that a card actually landed in frame
+   (the exit sensor only proves one left the deck).
+2. Take that region's rotated bounding rectangle, deskew and crop it to
+   an upright image sized to `CARD_OUTPUT_LONG_SIDE_PX` — this is the
+   image that actually gets uploaded, not the raw bucket photo.
+3. If that fails to find a clean region (first-card lighting mismatch,
+   two cards landing on top of each other, etc.), the rig logs a warning
+   and uploads the full raw frame rather than halting the pass — a soft
+   miss on one card isn't worth stopping a 1000-card job for, but it is
+   logged, not silent.
 
-1. Wire the Pi, camera, and both sensors on a breadboard with the motor
-   *disconnected*; run `scripts/feeder_calibrate.py` (monitor mode) and
-   confirm both sensors flip correctly when you block them by hand.
-2. Wire in the motor driver; run `scripts/feeder_calibrate.py --pulse`
-   to fire single pulses and tune `FEED_PULSE_SECONDS` against whatever
-   roller/belt mechanism you've built, using loose cards by hand before
-   the hopper exists.
-3. Build the hopper and singulation mechanism, re-tune pulse timing and
-   `FEED_TIMEOUT_SECONDS` against real card stock (sleeved and unsleeved
-   cards feed differently if that matters for your use case).
-4. Mount the camera and lighting, dial in framing and exposure using
-   `Picamera2`'s preview tools before wiring it into `rig/camera.py`'s
-   fixed still configuration.
-5. Run a small real job end to end with `--max-cards 10` before trusting
-   it with a full box.
+Raw (undeskewed) frames are also kept in `CAPTURE_DIR/raw/` for
+debugging — cheap insurance if the crop pipeline needs tuning.
+
+This is a software workaround for a mechanical decision, not a design
+you should try to defeat by squaring up the pile — a card landing well
+off-register just gives the diff/crop step a worse rectangle to work
+with.
+
+## What still needs measuring before a real job
+
+Two numbers are known-unmeasured, not defaulted, and will stop the rig
+cold (`SystemExit`, before any GPIO is touched) if you try to run
+`rig.cli` without them:
+
+- **`SETTLE_SECONDS`** — watch captured frames (`CAPTURE_DIR/raw/`) for
+  motion blur or mid-tumble shots and increase until they stop.
+- **`BUCKET_CAPACITY_CARDS`** — how many cards can land before the pile
+  risks the camera's 100mm minimum focus. Needs a verified count against
+  this specific gantry height, not a thickness-based guess.
+
+## Build / tuning order
+
+1. Wire the Pi and both sensors with the motor *disconnected*; run
+   `scripts/feeder_calibrate.py` (monitor mode) and confirm both flip
+   correctly when blocked by hand.
+2. Wire in the motor; run `scripts/feeder_calibrate.py --pulse` to fire
+   single pulses by hand-feeding loose cards, tuning `FEED_PULSE_SECONDS`
+   against the exit sensor's clear-edge timing. The script distinguishes
+   "never tripped" (misfeed) from "tripped and stuck" (jam) in its
+   output.
+3. Load the magazine, re-tune pulse timing and `FEED_TIMEOUT_SECONDS`
+   against real feeding (magazine feed differs from hand-feeding).
+4. Mount the camera and lighting; measure `SETTLE_SECONDS` by capturing
+   real drops and checking for blur/tumble in the raw frames.
+5. Run a full magazine (~150 cards) with `--max-cards 150` and watch the
+   pile grow to determine `BUCKET_CAPACITY_CARDS`.
+6. Only then run a real job.
