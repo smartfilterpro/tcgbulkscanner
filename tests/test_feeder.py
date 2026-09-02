@@ -110,3 +110,46 @@ def test_advance_one_card_sleeps_settle_seconds_after_clearing():
 
     assert elapsed >= 0.05
     feeder.close()
+
+
+def test_advance_one_card_returns_feed_result_with_edge_timing():
+    feeder = make_feeder()
+    exit_pin = Device.pin_factory.pin(27)
+    transit(exit_pin, after=0.03, low_for=0.04)
+
+    result = feeder.advance_one_card()
+
+    assert result.time_to_trip >= 0.03
+    assert result.low_duration >= 0.04
+    feeder.close()
+
+
+def test_active_low_false_inverts_hopper_interpretation():
+    # active_low=False: sensor reading HIGH means card present.
+    feeder = make_feeder(hopper_active_low=False)
+    hopper_pin = Device.pin_factory.pin(22)
+
+    hopper_pin.drive_high()
+    assert feeder.has_cards() is True
+
+    hopper_pin.drive_low()
+    assert feeder.has_cards() is False
+
+    feeder.close()
+
+
+def test_active_low_false_inverts_exit_sensor_interpretation():
+    # With exit_active_low=False, "present" means the pin reads HIGH, so
+    # a clean transit is HIGH->LOW->HIGH instead of the active-low default.
+    feeder = make_feeder(exit_active_low=False)
+    exit_pin = Device.pin_factory.pin(27)
+    exit_pin.drive_low()  # idle/not-present state under this polarity
+
+    def go_high():
+        exit_pin.drive_high()
+        threading.Timer(0.03, exit_pin.drive_low).start()
+
+    threading.Timer(0.03, go_high).start()
+
+    feeder.advance_one_card()  # should not raise
+    feeder.close()

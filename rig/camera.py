@@ -21,8 +21,8 @@ DEFAULT_SIZE = (1600, 1200)
 
 
 class Camera:
-    def __init__(self, size=DEFAULT_SIZE, warmup_seconds=1.0):
-        from libcamera import controls
+    def __init__(self, size=DEFAULT_SIZE, warmup_seconds=1.0, rotation_degrees=0):
+        from libcamera import Transform, controls
         from picamera2 import Picamera2
 
         self._controls = controls
@@ -31,8 +31,16 @@ class Camera:
         # order comes back as RGB and not BGR (a known picamera2/libcamera
         # quirk on some versions); swap in vision.save_jpeg if colors
         # look wrong in captured JPEGs.
+        #
+        # rotation_degrees defaults to 0 (no-op): whether the physical 90
+        # degree camera mount already produces a correctly-oriented raw
+        # frame, or needs this transform on top, is unverified from here.
+        # Confirm during bring-up and set CAMERA_ROTATION_DEGREES in .env
+        # if raw frames come out sideways — this is unverified against
+        # real hardware, check it works as expected on first use.
         still_config = self._cam.create_still_configuration(
-            main={"size": size, "format": "RGB888"}
+            main={"size": size, "format": "RGB888"},
+            transform=Transform(rotation=rotation_degrees),
         )
         self._cam.configure(still_config)
         self._cam.set_controls({"AfMode": controls.AfModeEnum.Auto})

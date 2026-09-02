@@ -2,12 +2,21 @@
 """Hardware bring-up helper for the feeder.
 
 Run this on the Pi once the motor and sensors are wired up, before
-trusting rig.cli to run a real job. It prints live sensor state so you
-can confirm polarity (does the reading flip when you block the beam by
-hand?) and lets you fire single feed pulses to tune FEED_PULSE_SECONDS
-and FEED_TIMEOUT_SECONDS against the exit-arch transit, which is what
-advance_one_card() actually waits on now (an edge pair, not a level —
-see rig/feeder.py).
+trusting rig.cli to run a real job.
+
+Monitor mode prints each sensor's RAW pin level alongside its
+INTERPRETED meaning (per HOPPER_SENSOR_ACTIVE_LOW / FEEDER_EXIT_SENSOR_
+ACTIVE_LOW in .env), so a polarity mismatch is obvious at a glance: if
+blocking a sensor doesn't change "empty"/"clear" to "CARD", the raw
+level is still flipping (check that first) or the wiring/aim is wrong.
+If the raw level flips correctly but the interpreted state doesn't
+match reality, fix it by flipping the *_ACTIVE_LOW value in .env — not
+by editing this script or rig/feeder.py.
+
+Pulse mode fires the motor and reports the exit-sensor edge-pair timing:
+how long after the pulse ended the sensor tripped, and how long it
+stayed tripped (transit time under the arch). That's what sets
+FEED_TIMEOUT_SECONDS (~2x the pulse) and sanity-checks SETTLE_SECONDS.
 
 This script deliberately does NOT require SETTLE_SECONDS or
 BUCKET_CAPACITY_CARDS to be set in .env — it doesn't use either (no
@@ -33,11 +42,19 @@ from rig.feeder import CardFeeder, FeederJam, FeederMisfeed
 
 def monitor(feeder):
     print("Ctrl-C to stop. Block/unblock each sensor by hand and watch it flip.")
+    print(
+        f"Configured polarity: hopper_active_low={feeder._hopper_active_low}  "
+        f"exit_active_low={feeder._exit_active_low}"
+    )
     try:
         while True:
+            hopper_raw = "LOW" if feeder._hopper_sensor.is_active else "HIGH"
+            exit_raw = "LOW" if feeder._exit_sensor.is_active else "HIGH"
+            hopper_present = feeder.has_cards()
+            exit_present = feeder._card_present(feeder._exit_sensor, feeder._exit_active_low)
             print(
-                f"\rhopper={'CARD' if feeder.has_cards() else 'empty':<6} "
-                f"exit={'CARD' if feeder._exit_sensor.is_active else 'clear':<6}",
+                f"\rhopper: raw={hopper_raw:<4} -> {'CARD ' if hopper_present else 'empty':<6} | "
+                f"exit: raw={exit_raw:<4} -> {'CARD ' if exit_present else 'clear':<6}",
                 end="",
                 flush=True,
             )
@@ -48,15 +65,19 @@ def monitor(feeder):
 
 def jog(feeder):
     print("Press Enter to fire one feed pulse, Ctrl-C to stop.")
-    print("Watch for: sensor never trips (misfeed) vs. trips and clears (ok) "
-          "vs. trips and stays tripped (hard jam under the arch).")
+    print(
+        "Reports: time from pulse-end to exit-sensor trip, and how long it "
+        "stayed tripped (transit time under the arch)."
+    )
     try:
         while True:
             input()
-            started = time.monotonic()
             try:
-                feeder.advance_one_card()
-                print(f"  -> ok, cleared the arch in {time.monotonic() - started:.2f}s")
+                result = feeder.advance_one_card()
+                print(
+                    f"  -> ok: tripped {result.time_to_trip * 1000:.0f}ms after "
+                    f"pulse end, stayed tripped {result.low_duration * 1000:.0f}ms"
+                )
             except FeederMisfeed as exc:
                 print(f"  -> misfeed: {exc}")
             except FeederJam as exc:
@@ -80,6 +101,8 @@ def main():
         pulse_seconds=cfg.feed_pulse_seconds,
         feed_timeout=cfg.feed_timeout_seconds,
         settle_seconds=0,
+        hopper_active_low=cfg.hopper_sensor_active_low,
+        exit_active_low=cfg.feeder_exit_sensor_active_low,
     )
     try:
         jog(feeder) if args.pulse else monitor(feeder)

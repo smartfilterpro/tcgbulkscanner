@@ -73,8 +73,10 @@ def run(args, cfg):
             pulse_seconds=cfg.feed_pulse_seconds,
             feed_timeout=cfg.feed_timeout_seconds,
             settle_seconds=cfg.settle_seconds,
+            hopper_active_low=cfg.hopper_sensor_active_low,
+            exit_active_low=cfg.feeder_exit_sensor_active_low,
         )
-        camera = Camera()
+        camera = Camera(rotation_degrees=cfg.camera_rotation_degrees)
 
         camera.refocus()
         baseline_gray = vision.to_gray(camera.capture_array())
@@ -99,7 +101,7 @@ def run(args, cfg):
                 break
 
             try:
-                feeder.advance_one_card()
+                feed_result = feeder.advance_one_card()
             except FeederJam as exc:
                 raise SystemExit(
                     f"HALT (hard jam): {exc} — do not retry the pulse; clear the "
@@ -109,6 +111,13 @@ def run(args, cfg):
                 raise SystemExit(
                     f"HALT (misfeed): {exc} — re-run this pass from seq={seq}"
                 )
+
+            logger.debug(
+                "seq=%s feed: tripped %.0fms after pulse end, transit %.0fms",
+                seq,
+                feed_result.time_to_trip * 1000,
+                feed_result.low_duration * 1000,
+            )
 
             if total_captured % cfg.refocus_every_cards == 0:
                 if not camera.refocus():
