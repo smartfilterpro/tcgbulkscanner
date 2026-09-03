@@ -5,8 +5,12 @@ Retry/halt behaviour mirrors the contract's reference loop:
   - 400 / 5xx / network error -> transient or content bug, retry the
     SAME job+pass+seq (safe: the server overwrites that slot) with
     backoff 1s, 2s, 4s, 8s, 16s, then halt.
-  - 200 with a seq that doesn't match what we sent -> pairing is
-    drifting, halt immediately (never silently continue).
+  - 200 with an ordinal that doesn't match what we sent -> pairing is
+    drifting, halt immediately (never silently continue). Checked
+    against `ordinal`, not `seq`: for pass 2, `seq` in the response is
+    DELIBERATELY the paired pass-1 row (N+1-ordinal), by design — that's
+    the whole point of the reverse-order pairing, not a sign of drift.
+    `ordinal` is the field that actually echoes what was sent.
 """
 
 import logging
@@ -25,7 +29,10 @@ class UploadHalt(RuntimeError):
 
 
 class SequenceMismatch(UploadHalt):
-    """The server echoed back a seq other than the one we sent."""
+    """The server assigned an ordinal, within this pass, other than the
+    seq we sent — not to be confused with the response's `seq` field,
+    which is deliberately something else on pass 2 (see uploader module
+    docstring)."""
 
 
 class PhotoUploader:
@@ -58,9 +65,10 @@ class PhotoUploader:
 
             if resp.status_code == 200:
                 body = resp.json()
-                if body.get("seq") != seq:
+                if body.get("ordinal") != seq:
                     raise SequenceMismatch(
-                        f"sent seq={seq} but server echoed seq={body.get('seq')}"
+                        f"sent seq={seq} but server assigned ordinal="
+                        f"{body.get('ordinal')} within this pass"
                         " — pairing is drifting, stop and tell the operator"
                     )
                 return body

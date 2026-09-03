@@ -92,3 +92,44 @@ def test_sequence_mismatch_halts(tmp_path):
         assert False, "expected SequenceMismatch"
     except SequenceMismatch:
         pass
+
+
+@responses.activate
+def test_pass2_seq_remap_is_not_a_mismatch(tmp_path):
+    # Pass 2's `seq` in the response is DELIBERATELY the paired pass-1 row
+    # (N+1-ordinal), not an echo of what was sent — this must not raise.
+    # (This is the exact shape of the false-positive halt bug: comparing
+    # against `seq` here made pass 2 halt almost immediately, always.)
+    photo = tmp_path / "frame.jpg"
+    photo.write_bytes(b"fake-jpeg")
+    responses.add(
+        responses.POST,
+        URL,
+        json={"ok": True, "pass": 2, "seq": 14, "ordinal": 1},
+        status=200,
+    )
+
+    result = make_uploader().upload("job-1", 2, 1, str(photo))
+
+    assert result["ordinal"] == 1
+    assert result["seq"] == 14
+
+
+@responses.activate
+def test_ordinal_mismatch_halts_even_if_seq_matches(tmp_path):
+    # The real drift signal is ordinal, not seq — confirm it's actually
+    # checked, not just coincidentally passing when the two line up.
+    photo = tmp_path / "frame.jpg"
+    photo.write_bytes(b"fake-jpeg")
+    responses.add(
+        responses.POST,
+        URL,
+        json={"ok": True, "pass": 2, "seq": 1, "ordinal": 7},
+        status=200,
+    )
+
+    try:
+        make_uploader().upload("job-1", 2, 1, str(photo))
+        assert False, "expected SequenceMismatch"
+    except SequenceMismatch:
+        pass
